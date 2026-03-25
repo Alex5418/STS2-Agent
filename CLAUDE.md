@@ -1,6 +1,8 @@
 # STS2 Local Agent
 
-A local LLM agent that plays Slay the Spire 2 autonomously via the STS2MCP game mod's REST API.
+A local LLM agent that plays Slay the Spire 2 autonomously via the [STS2MCP](https://github.com/Gennadiyev/STS2MCP) game mod's REST API.
+
+Built on top of **STS2MCP** by [@Gennadiyev](https://github.com/Gennadiyev), which provides the C# BepInEx mod and MCP server that make this project possible.
 
 ## Architecture
 
