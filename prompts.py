@@ -54,13 +54,13 @@ Action: play_card(card_index=2, target="jaw_worm_0")
 """
 
 MAP_ADDENDUM = """\
-You are on the MAP. Choose your next node carefully — look at BOTH the immediate node AND what it leads to.
+You are on the MAP. A path analysis hint may be provided below — consider it alongside your own assessment.
 
 PRIORITIES:
 1. Almost NEVER choose an Elite node in Act 1. Your deck cannot handle them.
 2. If HP < 50%: pick the path with a Rest Site or Shop. Avoid fights.
 3. If HP >= 50%: prefer Unknown > Shop > Monster.
-5. Look at the "leads_to" info — avoid paths that funnel into Elites.
+4. Look at the "leads_to" info — avoid paths that funnel into Elites.
 """
 
 REWARD_ADDENDUM = """\

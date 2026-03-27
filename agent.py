@@ -23,6 +23,7 @@ from config import (
     TURN_TIMEOUT_SECONDS,
     LOG_DIR, LOG_THINKING,
 )
+from map_planner import MapPlanner
 
 
 # ──────────────────────────────────────────────
@@ -277,6 +278,7 @@ def run_agent(model: str):
     llm = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
     game = GameAPI()
     logger = RunLogger(model)
+    map_planner = MapPlanner()
 
     # Conversation history — resets each new screen context
     history = []
@@ -290,6 +292,7 @@ def run_agent(model: str):
     combat_turn = 0           # Turn counter within a combat
     combat_actions = []       # Actions taken this combat (for summary)
     combat_hp_start = None    # HP at combat start
+    last_combat_hp = None     # Last known HP during combat (for hp_end)
 
     # ── Energy guard (client-side tracking to prevent EnergyCostTooHigh) ──
     remaining_energy = None   # Set at turn start from state JSON
@@ -365,11 +368,18 @@ def run_agent(model: str):
             def _get_player_hp():
                 return state_json.get("battle", {}).get("player", {}).get("hp", "?")
 
+            # Update last known combat HP every step we're in combat
+            if state_type in COMBAT_STATES:
+                hp = _get_player_hp()
+                if hp != "?":
+                    last_combat_hp = hp
+
             # ── 2. Detect state transitions ──
             if state_type != last_state_type:
                 # --- Combat just ended → log summary ---
                 if last_state_type in COMBAT_STATES and state_type not in COMBAT_STATES:
-                    hp_now = _get_player_hp()
+                    # Use cached HP from last combat step (post-combat state won't have battle.player.hp)
+                    hp_now = last_combat_hp if last_combat_hp is not None else "?"
                     summary = {
                         "event": "combat_summary",
                         "enemy_type": last_state_type,
@@ -387,6 +397,7 @@ def run_agent(model: str):
                     combat_turn = 0
                     combat_actions = []
                     combat_hp_start = _get_player_hp()
+                    last_combat_hp = None
 
                 history = []
                 last_state_type = state_type
@@ -410,12 +421,47 @@ def run_agent(model: str):
                 time.sleep(1)
                 continue
 
+            # ── Map planner: Act 1 bypass / Act 2+ hint ──
+            map_rec = None
+            if state_type == "map":
+                map_rec = map_planner.get_recommendation(state_json)
+                act = state_json.get("run", {}).get("act", 1)
+
+                if map_rec is not None and act == 1:
+                    idx, explanation = map_rec
+                    print(f"  [MapPlanner] Act 1 override: index {idx} — {explanation}")
+                    logger.log({
+                        "step": step, "event": "map_planner_override",
+                        "act": act, "chosen_index": idx, "explanation": explanation,
+                    })
+                    try:
+                        result = execute_tool_call(game, "choose_map_node", {"index": idx})
+                        print(f"  [Step {step}] choose_map_node({{'index': {idx}}}) ✓ (planner)")
+                    except Exception as e:
+                        print(f"  [Step {step}] Map planner execute failed: {e}")
+                    time.sleep(1.5)
+                    continue
+
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history[-MAX_HISTORY_TURNS * 2:])
-            messages.append({
-                "role": "user",
-                "content": f"Current game state:\n\n{state_text}\n\nChoose your action.",
-            })
+
+            # Build user message with optional hints
+            user_content = f"Current game state:\n\n{state_text}\n\n"
+
+            # Hint: map planner recommendation for Act 2+
+            if state_type == "map" and map_rec is not None:
+                idx, explanation = map_rec
+                user_content += f"MAP HINT: Path analysis recommends index {idx}. {explanation}. You may override if you have good strategic reasons.\n\n"
+
+            # Hint: remind about 0-cost cards when energy is 0
+            if state_type in COMBAT_STATES and remaining_energy == 0:
+                zero_cost_cards = [c for c in combat_info.get("hand", []) if c["cost"] == 0]
+                if zero_cost_cards:
+                    names = ", ".join(f"{c['name']} (index {c['index']})" for c in zero_cost_cards)
+                    user_content += f"REMINDER: You have 0 energy but can still play these 0-cost cards: {names}\n\n"
+
+            user_content += "Choose your action."
+            messages.append({"role": "user", "content": user_content})
 
             # ── 4. Call LLM ──
             t0 = time.time()
@@ -586,11 +632,30 @@ def run_agent(model: str):
                             game.proceed()
                         except Exception:
                             pass
+                    # After rest site action (Smith/Rest), auto-proceed to avoid retry errors
+                    if tool_name == "choose_rest_option":
+                        print(f"  [Step {step}] Auto-proceed after rest option")
+                        time.sleep(1)  # Give game time to process
+                        try:
+                            game.proceed()
+                        except Exception:
+                            pass
+                    # After selecting a card in hand_select/card_select, auto-confirm
+                    # Prevents infinite select loop (e.g. Armaments upgrade prompt)
+                    if tool_name in ("combat_select_card", "select_card"):
+                        print(f"  [Step {step}] Auto-confirm after card selection")
+                        try:
+                            if tool_name == "combat_select_card":
+                                game.combat_confirm_selection()
+                            else:
+                                game.confirm_selection()
+                        except Exception:
+                            pass
                     # Decrement energy on successful card play
                     if tool_name == "play_card" and remaining_energy is not None:
                         card_idx = args.get("card_index")
                         card_cost = hand_costs.get(card_idx, 0)
-                        if card_cost > 0:
+                        if card_cost >= 0:
                             remaining_energy = max(0, remaining_energy - card_cost)
                 else:
                     print(f"✗ {error_msg}")
