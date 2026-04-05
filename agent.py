@@ -18,7 +18,7 @@ from tools import get_tools_for_state
 from prompts import get_prompt_for_state
 from config import (
     OLLAMA_BASE_URL, OLLAMA_API_KEY, ACTIVE_MODEL,
-    LLM_TEMPERATURE, LLM_MAX_TOKENS,
+    LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_REPEAT_PENALTY,
     MAX_RETRIES_PER_ACTION, MAX_HISTORY_TURNS,
     TURN_TIMEOUT_SECONDS,
     LOG_DIR, LOG_THINKING,
@@ -238,6 +238,137 @@ def execute_tool_call(game: GameAPI, name: str, args: dict) -> str:
 COMBAT_STATES = ("monster", "elite", "boss")
 
 
+def _compute_combat_hints(state_json: dict) -> str:
+    """Pre-compute damage math from card descriptions and enemy state.
+
+    Parses actual damage/block values from the game's card descriptions
+    (which already include Strength, Dexterity, Weak, Frail, relic bonuses, etc.)
+    and only applies Vulnerable on top (since that's an enemy-side effect
+    not reflected in card descriptions).
+    """
+    import math
+    battle = state_json.get("battle", {})
+    player = battle.get("player", {})
+    enemies = battle.get("enemies", [])
+    if not enemies:
+        return ""
+
+    hand = player.get("hand", [])
+
+    lines = ["COMBAT MATH (pre-computed, trust these numbers):"]
+
+    # Incoming damage from enemy intents
+    total_incoming = 0
+    for e in enemies:
+        edmg = _parse_enemy_intent_damage(e)
+        if edmg > 0:
+            total_incoming += edmg
+    lines.append(f"- Total incoming damage this turn: {total_incoming}")
+    current_block = player.get("block", 0)
+    if total_incoming > 0:
+        net = max(0, total_incoming - current_block)
+        lines.append(f"- Your block: {current_block} → net damage if no more block: {net}")
+
+    # Parse each hand card's effective damage/block from description
+    lines.append("- Hand cards (effective values):")
+    for card in hand:
+        idx = card.get("index", "?")
+        name = card.get("name", "?")
+        cost = card.get("cost", "?")
+        desc = card.get("description", "") or ""
+        ctype = (card.get("type", "") or "").lower()
+        can_play = card.get("can_play", True)
+
+        parts = []
+        dmg, hits = _parse_card_damage(desc)
+        block = _parse_card_block(desc)
+        if dmg > 0:
+            parts.append(f"{dmg}dmg" + (f" x{hits}" if hits > 1 else ""))
+        if block > 0:
+            parts.append(f"{block}block")
+        if not parts:
+            # Show description snippet for non-standard cards
+            parts.append(desc[:60] if desc else ctype)
+
+        status = "" if can_play else " [UNPLAYABLE]"
+        lines.append(f"  [{idx}] {name} (cost {cost}): {', '.join(parts)}{status}")
+
+    # Per-enemy kill check
+    lines.append("- Kill thresholds:")
+    for e in enemies:
+        eid = e.get("entity_id", "?")
+        name = e.get("name", "?")
+        hp = e.get("hp", 0)
+        eblock = e.get("block", 0)
+        e_statuses = e.get("status", [])
+        vuln = _get_status(e_statuses, "vulnerable")
+
+        effective_hp = hp + eblock
+        vuln_note = ""
+        if vuln > 0:
+            # Calculate how much raw damage you actually need to deal
+            # since vulnerable means your damage is multiplied by 1.5
+            raw_needed = math.ceil(effective_hp / 1.5)
+            vuln_note = f" (VULNERABLE: only need {raw_needed} raw damage)"
+        lines.append(f"  {name} ({eid}): {hp}HP + {eblock}block = {effective_hp} to kill{vuln_note}")
+
+    return "\n".join(lines)
+
+
+def _parse_card_damage(desc: str) -> tuple:
+    """Parse damage from card description like 'Deal 8 damage' or 'Deal 5 damage 3 times'.
+    Returns (damage_per_hit, hits).
+    """
+    import re
+    m = re.search(r"[Dd]eal\s+(\d+)\s+damage", desc)
+    if not m:
+        return 0, 1
+    dmg = int(m.group(1))
+    hits_m = re.search(r"(\d+)\s+times", desc)
+    hits = int(hits_m.group(1)) if hits_m else 1
+    return dmg, hits
+
+
+def _parse_card_block(desc: str) -> int:
+    """Parse block from card description like 'Gain 5 Block'."""
+    import re
+    m = re.search(r"[Gg]ain\s+(\d+)\s+[Bb]lock", desc)
+    return int(m.group(1)) if m else 0
+
+
+def _get_status(statuses: list, name: str) -> int:
+    """Get status effect amount, 0 if not present."""
+    for s in statuses:
+        if s.get("id", "").lower() == name.lower():
+            amt = s.get("amount", 0)
+            return amt if amt != -1 else 999
+    return 0
+
+
+def _parse_enemy_intent_damage(enemy: dict) -> int:
+    """Parse total damage from enemy intents."""
+    total = 0
+    for intent in enemy.get("intents", []):
+        itype = intent.get("type", "").lower()
+        if "attack" not in itype and "aggressive" not in itype:
+            continue
+        label = intent.get("label", "").strip()
+        if not label:
+            continue
+        if "x" in label.lower():
+            parts = label.lower().split("x")
+            try:
+                total += int(parts[0].strip()) * int(parts[1].strip())
+            except (ValueError, IndexError):
+                pass
+        else:
+            try:
+                total += int(label)
+            except ValueError:
+                pass
+    return total
+
+
 def _parse_combat_info(state_json: dict) -> dict:
     """Extract energy and card costs from state JSON for client-side validation.
 
@@ -268,14 +399,15 @@ def _parse_combat_info(state_json: dict) -> dict:
     return {"energy": energy, "hand": hand, "is_play_phase": is_play_phase}
 
 
-def run_agent(model: str):
+def run_agent(model: str, base_url: str):
     """Main agent loop."""
     print(f"\n{'='*60}")
     print(f"  STS2 Local Agent")
     print(f"  Model: {model}")
+    print(f"  URL:   {base_url}")
     print(f"{'='*60}\n")
 
-    llm = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
+    llm = OpenAI(base_url=base_url, api_key=OLLAMA_API_KEY)
     game = GameAPI()
     logger = RunLogger(model)
     map_planner = MapPlanner()
@@ -402,6 +534,7 @@ def run_agent(model: str):
                 history = []
                 last_state_type = state_type
                 error_count = 0
+                selected_card_indices = set()  # Track toggled cards in card_select
                 print(f"\n--- State: {state_type} (floor {current_floor}) ---")
 
             # Track combat turns (each new state fetch in combat = new turn)
@@ -448,10 +581,34 @@ def run_agent(model: str):
             # Build user message with optional hints
             user_content = f"Current game state:\n\n{state_text}\n\n"
 
+            # Hint: pre-computed combat math
+            if state_type in COMBAT_STATES:
+                combat_hints = _compute_combat_hints(state_json)
+                if combat_hints:
+                    user_content += combat_hints + "\n\n"
+
             # Hint: map planner recommendation for Act 2+
             if state_type == "map" and map_rec is not None:
                 idx, explanation = map_rec
                 user_content += f"MAP HINT: Path analysis recommends index {idx}. {explanation}. You may override if you have good strategic reasons.\n\n"
+
+            # Auto end_turn: no playable cards in hand (all cost > remaining energy, no 0-cost)
+            if state_type in COMBAT_STATES and remaining_energy is not None:
+                playable = [c for c in combat_info.get("hand", [])
+                            if c["cost"] >= 0 and c["cost"] <= remaining_energy]
+                if not playable:
+                    print(f"  [Auto] No playable cards (energy={remaining_energy}), ending turn")
+                    try:
+                        game.end_turn()
+                        logger.log({
+                            "step": step, "event": "auto_end_turn",
+                            "state_type": state_type, "energy": remaining_energy,
+                        })
+                    except Exception:
+                        pass
+                    step += 1
+                    time.sleep(0.5)
+                    continue
 
             # Hint: remind about 0-cost cards when energy is 0
             if state_type in COMBAT_STATES and remaining_energy == 0:
@@ -474,6 +631,7 @@ def run_agent(model: str):
                     temperature=LLM_TEMPERATURE,
                     max_tokens=LLM_MAX_TOKENS,
                     timeout=TURN_TIMEOUT_SECONDS,
+                    extra_body={"repeat_penalty": LLM_REPEAT_PENALTY},
                 )
             except Exception as e:
                 err_str = str(e)
@@ -487,8 +645,9 @@ def run_agent(model: str):
                             tools=tools,
                             tool_choice="auto",
                             temperature=LLM_TEMPERATURE,
-                            max_tokens=512,  # Force shorter response
+                            max_tokens=256,  # Force shorter response
                             timeout=TURN_TIMEOUT_SECONDS,
+                            extra_body={"repeat_penalty": LLM_REPEAT_PENALTY},
                         )
                     except Exception as e2:
                         print(f"[ERROR] LLM retry also failed: {e2}")
@@ -505,6 +664,14 @@ def run_agent(model: str):
             latency = int((time.time() - t0) * 1000)
             msg = response.choices[0].message
             content = msg.content or ""
+            finish_reason = response.choices[0].finish_reason or ""
+
+            # Debug: warn on empty or truncated responses
+            if not content and not msg.tool_calls:
+                usage = response.usage
+                print(f"  [WARN] Empty LLM response (finish={finish_reason}, "
+                      f"prompt={getattr(usage, 'prompt_tokens', '?')}, "
+                      f"comp={getattr(usage, 'completion_tokens', '?')})")
 
             # ── 5. Extract reasoning ──
             thinking, visible_text = extract_reasoning(content)
@@ -512,7 +679,10 @@ def run_agent(model: str):
 
             # Log reasoning once per turn (not per card play)
             if reasoning and LOG_THINKING:
-                print(f"  [Reason] {reasoning[:300]}")
+                if thinking:
+                    print(f"  [Think] {thinking[:500]}")
+                if visible_text:
+                    print(f"  [Reason] {visible_text[:500]}")
                 logger.log({
                     "step": step,
                     "event": "turn_reasoning",
@@ -540,10 +710,15 @@ def run_agent(model: str):
                         parsed_args = raw_args
                     else:
                         parsed_args = {}
+                    # Extract reasoning from tool args (display + log, don't send to game)
+                    tc_reasoning = parsed_args.pop("reasoning", None)
+                    if tc_reasoning and LOG_THINKING:
+                        print(f"  [Reason] {tc_reasoning[:500]}")
                     tool_calls_to_process.append({
                         "id": tc.id,
                         "name": tc.function.name,
                         "args": parsed_args,
+                        "reasoning": tc_reasoning,
                     })
 
             # Fallback: if structured parsing yielded nothing, try text parsing
@@ -560,23 +735,22 @@ def run_agent(model: str):
                     })
 
             if not tool_calls_to_process:
-                # First miss: nudge the model to act with a direct follow-up
+                # First miss: nudge the model with a clean retry (no polluted history)
                 if error_count == 0:
-                    print(f"  [Step {step}] No tool call, nudging...")
-                    # Add the model's text response to history, then send a nudge
-                    history.append({"role": "assistant", "content": content})
-                    history.append({"role": "user", "content": (
-                        "You must call a tool now. Pick the best available action "
-                        "and call it. Do not respond with text."
-                    )})
+                    print(f"  [Step {step}] No tool call (finish={finish_reason}), retrying with clean context...")
+                    history = []  # Clear history to avoid empty-assistant poisoning
                     error_count += 1
-                    continue  # Re-enter loop (state will be re-fetched, nudge is in history)
+                    continue  # Re-enter loop with fresh messages
 
                 # Subsequent misses: log and count
                 print(f"  [Step {step}] No tool call. LLM said: {content[:200]}")
+                usage = response.usage
                 logger.log({
                     "step": step, "state_type": state_type,
                     "event": "no_tool_call", "content": content[:500],
+                    "finish_reason": finish_reason,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
                     "latency_ms": latency,
                 })
                 error_count += 1
@@ -597,6 +771,21 @@ def run_agent(model: str):
                 tool_name = tc_info["name"]
                 args = tc_info["args"]
                 tc_id = tc_info["id"]
+                tc_reasoning = tc_info.get("reasoning")
+
+                # ── Card select guard: prevent toggling same card back off ──
+                if tool_name == "select_card" and state_type == "card_select":
+                    sel_idx = args.get("index")
+                    if sel_idx in selected_card_indices:
+                        # Model is about to deselect — pick next unselected card instead
+                        # Find all card indices from state
+                        cs_data = state_json.get("card_select", {})
+                        all_indices = [c.get("index", i) for i, c in enumerate(cs_data.get("cards", []))]
+                        alt = next((i for i in all_indices if i not in selected_card_indices), None)
+                        if alt is not None:
+                            print(f"  [Guard] select_card({sel_idx}) would deselect → redirecting to index {alt}")
+                            args["index"] = alt
+                            sel_idx = alt
 
                 # ── Energy guard: block play_card if insufficient energy ──
                 if tool_name == "play_card" and state_type in COMBAT_STATES and remaining_energy is not None:
@@ -614,6 +803,24 @@ def run_agent(model: str):
                         _force_advance(game, state_type, logger, step)
                         error_count = 0
                         break
+
+                # ── Target fix: correct entity_id casing from state JSON ──
+                if tool_name == "play_card" and "target" in args and state_type in COMBAT_STATES:
+                    target = args["target"]
+                    if target and target.lower() not in ("self", "allenemies", "all_enemies"):
+                        # Build lookup of valid entity_ids from state JSON
+                        enemies = state_json.get("battle", {}).get("enemies", [])
+                        valid_ids = {e.get("entity_id", ""): e.get("entity_id", "") for e in enemies}
+                        # Case-insensitive match
+                        target_lower = target.lower()
+                        matched = None
+                        for eid in valid_ids:
+                            if eid.lower() == target_lower:
+                                matched = eid
+                                break
+                        if matched and matched != target:
+                            print(f"  [Step {step}] Target fix: {target} → {matched}")
+                            args["target"] = matched
 
                 print(f"  [Step {step}] {tool_name}({args}) ", end="")
                 result_str = execute_tool_call(game, tool_name, args)
@@ -640,15 +847,35 @@ def run_agent(model: str):
                             game.proceed()
                         except Exception:
                             pass
-                    # After selecting a card in hand_select/card_select, auto-confirm
-                    # Prevents infinite select loop (e.g. Armaments upgrade prompt)
+                    # Track selected card index for toggle guard
+                    if tool_name == "select_card" and state_type == "card_select":
+                        sel_idx = args.get("index")
+                        if sel_idx in selected_card_indices:
+                            selected_card_indices.discard(sel_idx)
+                        else:
+                            selected_card_indices.add(sel_idx)
+
+                    # After selecting a card in hand_select/card_select, check can_confirm
+                    # Some events need multiple selections (e.g. Gorge = 2 cards)
+                    # Only confirm when the game says we've selected enough
                     if tool_name in ("combat_select_card", "select_card"):
-                        print(f"  [Step {step}] Auto-confirm after card selection")
                         try:
-                            if tool_name == "combat_select_card":
-                                game.combat_confirm_selection()
+                            check_json = game.get_state_json()
+                            check_type = check_json.get("state_type", "")
+                            # Find can_confirm in the appropriate state data
+                            can_confirm = False
+                            if check_type == "hand_select":
+                                can_confirm = check_json.get("hand_select", {}).get("can_confirm", False)
+                            elif check_type == "card_select":
+                                can_confirm = check_json.get("card_select", {}).get("can_confirm", False)
+                            if can_confirm:
+                                print(f"  [Step {step}] Auto-confirm (can_confirm=true)")
+                                if tool_name == "combat_select_card":
+                                    game.combat_confirm_selection()
+                                else:
+                                    game.confirm_selection()
                             else:
-                                game.confirm_selection()
+                                print(f"  [Step {step}] Selection registered, need more cards")
                         except Exception:
                             pass
                     # Decrement energy on successful card play
@@ -661,8 +888,8 @@ def run_agent(model: str):
                     print(f"✗ {error_msg}")
                     error_count += 1
 
-                # Log action (no thinking here — reasoning is logged separately above)
-                logger.log({
+                # Log action with inline reasoning from tool call
+                log_entry = {
                     "step": step,
                     "event": "action",
                     "state_type": state_type,
@@ -670,7 +897,10 @@ def run_agent(model: str):
                     "args": args,
                     "result_status": status,
                     "result_message": result.get("message") or error_msg,
-                })
+                }
+                if tc_reasoning:
+                    log_entry["reasoning"] = tc_reasoning
+                logger.log(log_entry)
 
                 # Track combat actions for summary
                 if state_type in COMBAT_STATES:
@@ -692,6 +922,13 @@ def run_agent(model: str):
                 if "EnergyCostTooHigh" in error_msg and state_type in COMBAT_STATES:
                     print(f"  [Step {step}] Out of energy, auto end_turn")
                     _force_advance(game, state_type, logger, step)
+                    error_count = 0
+                    break
+
+                # Target not found → enemy died, clear history so LLM re-reads state
+                if "not found" in error_msg.lower() and state_type in COMBAT_STATES:
+                    print(f"  [Step {step}] Invalid target, re-fetching state")
+                    history = []  # Force LLM to read fresh state
                     error_count = 0
                     break
 
@@ -778,8 +1015,30 @@ def _force_advance(game: GameAPI, state_type: str, logger: RunLogger, step: int)
 # Entry point
 # ──────────────────────────────────────────────
 
+BACKENDS = {
+    "ollama":     "http://localhost:11434/v1",
+    "koboldcpp":  "http://localhost:5001/v1",
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="STS2 Local Agent")
-    parser.add_argument("--model", default=ACTIVE_MODEL, help="Ollama model name")
+    parser.add_argument("--model", default=None,
+                        help="Model name (e.g. gemma4:26b, koboldcpp). Defaults to config.py ACTIVE_MODEL.")
+    parser.add_argument("--backend", choices=BACKENDS.keys(), default=None,
+                        help="Named backend preset: ollama (:11434) or koboldcpp (:5001)")
+    parser.add_argument("--url", default=None,
+                        help="Raw base URL override (e.g. http://localhost:11434/v1)")
     args = parser.parse_args()
-    run_agent(args.model)
+
+    # Resolve URL: --url > --backend > config
+    if args.url:
+        base_url = args.url
+    elif args.backend:
+        base_url = BACKENDS[args.backend]
+    else:
+        base_url = OLLAMA_BASE_URL
+
+    # Resolve model: --model > config
+    model = args.model or ACTIVE_MODEL
+
+    run_agent(model, base_url)

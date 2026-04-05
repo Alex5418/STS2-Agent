@@ -1,5 +1,7 @@
 """HTTP wrapper for the STS2 game mod REST API."""
 
+from __future__ import annotations
+
 import httpx
 from config import GAME_API_URL
 

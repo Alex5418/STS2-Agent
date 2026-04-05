@@ -3,11 +3,21 @@
 Tools are organized by game state_type so the LLM only sees
 relevant actions for the current screen.
 """
+from __future__ import annotations
+
+
+REASONING_PARAM = {
+    "reasoning": {
+        "type": "string",
+        "description": "Brief reasoning for this action (1-2 sentences). Think step by step: what is the situation, why this action.",
+    },
+}
 
 
 def _tool(name: str, desc: str, params: dict, required: list[str] | None = None):
     """Helper to build an OpenAI-format tool definition."""
-    schema = {"type": "object", "properties": params}
+    all_params = {**REASONING_PARAM, **params}
+    schema = {"type": "object", "properties": all_params}
     if required:
         schema["required"] = required
     return {
@@ -149,14 +159,17 @@ ADVANCE_DIALOGUE = _tool(
 
 SELECT_CARD = _tool(
     "select_card",
-    "Select a card in the deck card selection screen (upgrade, transform, remove).",
+    "Toggle a card's selection in the card selection screen (upgrade, transform, remove). "
+    "WARNING: This is a toggle — calling it on an already-selected card will DESELECT it. "
+    "To select 2 cards, call select_card with TWO DIFFERENT indices (e.g. index=0, then index=1). "
+    "Do NOT call the same index twice or you will deselect it.",
     {"index": {"type": "integer", "description": "Card index in the grid"}},
     required=["index"],
 )
 
 CONFIRM_SELECTION = _tool(
     "confirm_selection",
-    "Confirm the current card selection (after selecting cards to upgrade/transform/remove).",
+    "Confirm the current card selection. Only call this AFTER you have selected the required number of cards.",
     {},
 )
 
@@ -203,7 +216,7 @@ TOOLS_BY_STATE = {
     "card_reward":     [PICK_CARD, SKIP_CARD],
     "rest_site":       [REST_OPTION, PROCEED],
     "shop":            [SHOP_PURCHASE, PROCEED],
-    "event":           [EVENT_OPTION, ADVANCE_DIALOGUE],
+    "event":           [EVENT_OPTION, ADVANCE_DIALOGUE, PROCEED],
     "card_select":     [SELECT_CARD, CONFIRM_SELECTION],
     "relic_select":    [SELECT_RELIC, SKIP_RELIC],
     "treasure":        [CLAIM_TREASURE, PROCEED],
